@@ -1,16 +1,5 @@
 #!/usr/bin/env python3
-"""gate_correct.py – Gwiezdne Wrota 4.11 (obsługa pojedynczego procesu)
-
-• Jedna brama, pojemność Y.
-• Brama zmienia kierunek wyłącznie w obsłudze RELEASE;
-  przełącza się *tylko* wtedy, gdy po usunięciu wpisu kolejki Q
-  czoło jest innego koloru (lub Q jest puste).
-• Nie używamy dodatkowego licznika „ile procesów w tunelu”.
-• Gdy którykolwiek proces skończy swoje iteracje, wysyła TERMINATE,
-  a wszystkie pozostałe przerywają pętlę i od razu kończą program.
-• Obsługa przypadku N=1: od razu wchodzimy i opuszczamy tunel bez blokowania.
-
-Autor: Piotr <twoje_nazwisko>, 2025-06-06 (aktualizacja 4.11)
+"""
 """
 
 from mpi4py import MPI
@@ -46,7 +35,6 @@ class MType(Enum):
     RELEASE   = 2
     TERMINATE = 3  # sygnał zakończenia
 
-
 def _log(r, t, s):
     if not SILENT:
         print(f"[{r}] [t{t:06d}] {s}", flush=True)
@@ -63,12 +51,12 @@ class Proc:
         self.clock   = 0
         self.state   = State.RELEASED
         self.wantDir = None
-        self.gateDir = DIR.A           # startowy kierunek bramy
+        self.gateDir = DIR.A           # startowy kierunek bramy (dowolnie A)
         self.Acked   = [True] * self.N
         self.Q       = []              # kopiec (ts, pid, dir)
         self.reqTS   = None            # timestamp naszego REQUEST
-        self.active  = [True] * self.N # czy proces się nie zakończył
-        self.should_terminate = False  # flaga kończenia na TERMINATE
+        self.active  = [True] * self.N # czy proces jeszcze nie dał TERMINATE
+        self.should_terminate = False  # flaga, by przerwać natychmiast
 
     # ---- Lamport ----
     def _tick(self):
@@ -87,40 +75,47 @@ class Proc:
         for p in self.peers:
             self._send(p, typ, **pl)
 
-    # ---- sprawdzenie, czy mogę wejść (myTurn) ----
+    # ---- myTurn: czy mogę wejść? ----
     def _my_turn(self):
         if not self.Q:
             return False
-        sortedQ = sorted(self.Q)  # uporządkowane rosnąco po (ts, pid, dir)
+        sortedQ = sorted(self.Q)  # rosnąco po (ts,pid,dir)
         head_ts, head_pid, head_dir = sortedQ[0]
-        # jeśli czołowy wpis nie ma kierunku gateDir, od razu False
+        # 1) jeśli czołowy nie pasuje do gateDir → nie mogę wejść
         if DIR(head_dir) != self.gateDir:
             return False
-        # zlicz wpisy o tym samym kolorze aż do siebie
+        # 2) zlicz, ile wpisów o gateDir stoi do mojego pid
         pos = 0
         for ts_i, pid_i, dir_i in sortedQ:
             if DIR(dir_i) != self.gateDir:
                 break
             pos += 1
             if pid_i == self.id:
-                return pos <= Y
+                return (pos <= Y)
         return False
 
-    # ---- handlery ----
+    # ---- handler dla REQUEST ----
     def _h_req(self, src, ts, dir_):
+        # 1) zaktualizowany clock już był w _poll()
         heapq.heappush(self.Q, (ts, src, dir_))
-        # jeżeli tunel pusty i czołowy wpis = inny kolor → przełącz
+
+        # 2) jeśli tunel pusty (tj. żadnego HELD) i czołowy <normalnie> inny kolor:
         if self.state != State.HELD and DIR(self.Q[0][2]) != self.gateDir:
+            # przełącz tunel na kolor czoła
             self.gateDir = DIR(self.Q[0][2])
             _log(self.id, self.clock,
                  f"Ustawiam bramę na {self.gateDir.name} (tunel pusty)")
+
+        # 3) odeślij ACK
         self._send(src, MType.ACK, ts=self.clock)
 
+    # ---- handler dla ACK ----
     def _h_ack(self, src):
         self.Acked[src] = True
 
+    # ---- handler dla RELEASE ----
     def _h_rel(self, src, ts, dir_):
-        # usuń wszystkie wpisy danego PID
+        # 1) usuwamy wszystkie wpisy danego procesu (pid=src), bo każdy REQUEST dubluje się po zmianach
         to_remove = [entry for entry in self.Q if entry[1] == src]
         for entry in to_remove:
             try:
@@ -129,22 +124,25 @@ class Proc:
                 pass
         if to_remove:
             heapq.heapify(self.Q)
-        # po usunięciu: jeżeli czołowy innego koloru, zmień gateDir
+
+        # 2) jeśli kolejka nie jest pusta i czołowy wpis ma inny kolor niż gateDir, przełącz
         if self.Q and DIR(self.Q[0][2]) != self.gateDir:
             self.gateDir = DIR(self.Q[0][2])
             _log(self.id, self.clock,
                  f"Przestawiam bramę na {self.gateDir.name}")
 
+    # ---- handler dla TERMINATE ----
     def _h_term(self, src):
-        # sygnał zakończenia od dowolnego procesu
+        # natychmiast przerywamy, jeśli dowolny proces wyśle TERMINATE
         self.should_terminate = True
 
-    # ---- polling ----
+    # ---- odbiór wiadomości non‐blocking ----
     def _poll(self):
         st = MPI.Status()
         while self.c.Iprobe(source=MPI.ANY_SOURCE, tag=0, status=st):
             src = st.Get_source()
             typ_val, pl = self.c.recv(source=src, tag=0)
+            # zaktualizuj zegar Lamporta, jeśli jest ts
             if "ts" in pl:
                 self._upd(pl["ts"])
             typ = MType(typ_val)
@@ -157,31 +155,26 @@ class Proc:
             elif typ is MType.TERMINATE:
                 self._h_term(src)
 
-    # ---- wejście / wyjście z tunelu ----
+    # ---- procedura wejścia do tunelu ----
     def enter(self, d: DIR):
-        # obsługa przypadku N=1: natychmiast przejdź i wyjdź
-        if self.N == 1:
-            # od razu ustaw kierunek, wejdź, wyjdź
-            self.state = State.HELD
-            self.gateDir = d
-            _log(self.id, self.clock, f"==> WCHODZĘ (solo, {d.name}) <==")
-            self.state = State.RELEASED
-            _log(self.id, self.clock, f"<== WYCHODZĘ (solo, {d.name}) ==>")
-            return
-
         self.state, self.wantDir = State.WANTED, d
         ts = self._tick()
         self.reqTS = ts
+
+        # resetujemy ACK od wszystkich peerów
         for p in self.peers:
             self.Acked[p] = False
 
+        # wrzucamy własny REQUEST do kolejki i rozsyłamy
         heapq.heappush(self.Q, (ts, self.id, d.value))
         self._bcast(MType.REQUEST, dir=d.value, ts=ts)
         _log(self.id, self.clock, f"Staram się o {d.name}")
 
+        # czekamy aż: od wszystkich ACKi i myTurn == True
         while True:
             if self.should_terminate:
-                return
+                return  # jeśli już TERMINATE, natychmiast kończymy
+
             self._poll()
             if all(self.Acked[p] or not self.active[p] for p in self.peers) \
                and self._my_turn():
@@ -190,7 +183,9 @@ class Proc:
                 break
             time.sleep(0.001)
 
+    # ---- procedura opuszczenia tunelu ----
     def leave(self):
+        # usuwamy lokalnie SWÓJ wpis (reqTS, id, wantDir)
         try:
             self.Q.remove((self.reqTS, self.id, self.wantDir.value))
             heapq.heapify(self.Q)
@@ -198,6 +193,7 @@ class Proc:
             pass
 
         self.state = State.RELEASED
+        # rozsyłamy RELEASE aktualnego gateDir
         self._bcast(MType.RELEASE, dir=self.gateDir.value, ts=self._tick())
         _log(self.id, self.clock, "<== WYCHODZĘ ==>")
 
@@ -206,6 +202,7 @@ class Proc:
         random.seed(self.id * 1234 + int(time.time()))
 
         for _ in range(ITERS):
+            # jeśli już ktoś wysłał TERMINATE, przerwijmy resztę
             if self.should_terminate:
                 break
 
@@ -219,11 +216,12 @@ class Proc:
             if self.should_terminate:
                 break
 
+            # próbujemy wejść
             self.enter(random.choice([DIR.A, DIR.B]))
             if self.should_terminate:
                 break
 
-            # tunel: symulowane przejście
+            # „przejście przez tunel” – krótka pauza, w trakcie której _poll() też działa
             t_in = time.time() + random.uniform(0.15, 0.3)
             while time.time() < t_in:
                 if self.should_terminate:
@@ -233,12 +231,15 @@ class Proc:
             if self.should_terminate:
                 break
 
+            # opuszczamy tunel
             self.leave()
 
+        # jeżeli jeszcze nie dostaliśmy TERMINATE, to wysyłamy go jako pierwsi
         if not self.should_terminate:
             self._bcast(MType.TERMINATE, ts=self._tick())
             _log(self.id, self.clock, "TERMINATE")
 
+        # czekamy krótką chwilę (0.3 s), by inni odebrali TERMINATE
         t_fin = time.time() + 0.3
         while time.time() < t_fin:
             self._poll()
